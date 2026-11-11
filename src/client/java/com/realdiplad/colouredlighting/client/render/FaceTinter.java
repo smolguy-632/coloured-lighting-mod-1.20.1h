@@ -23,97 +23,122 @@ import net.minecraft.world.BlockRenderView;
  * One instance per thread; not thread-safe.
  */
 public final class FaceTinter {
-	private final BlockPos.Mutable m = new BlockPos.Mutable();
-	public float r = 1f, g = 1f, b = 1f;
+	private final BlockPos.Mutable scratchPos = new BlockPos.Mutable();
+
+	// One-entry memo for the per-cell lookups below. Consecutive vertices of a quad (and faces of
+	// the same block) touch the same cells, so the hit rate is high during chunk meshing.
+	private long lastCellKey;
+	private BlockState lastCellState;
+	private boolean lastCellOpaque;
+	private int lastCellHue = -1;
+
+	/** Final vertex colour multipliers, read back by the caller after {@link #compute}. */
+	public float redMultiplier = 1f, greenMultiplier = 1f, blueMultiplier = 1f;
+
+	private BlockState cellState(BlockRenderView world, int cellX, int cellY, int cellZ) {
+		long cellKey = (cellX & 0x3FFFFF) | ((long) (cellY & 0x3FFFFF) << 22) | ((long) (cellZ & 0x3FFFFF) << 44);
+		if (cellKey != lastCellKey) {
+			scratchPos.set(cellX, cellY, cellZ);
+			lastCellState = world.getBlockState(scratchPos);
+			lastCellOpaque = lastCellState.isOpaqueFullCube(world, scratchPos);
+			lastCellHue = lastCellOpaque ? BlockColourCache.albedoHue(lastCellState) : -1;
+			lastCellKey = cellKey;
+		}
+		return lastCellState;
+	}
 
 	/**
-	 * @param lx,ly,lz vertex position inside its block (0..1)
-	 * @param nx,ny,nz vertex normal
-	 * @param light    packed lightmap coords (block << 4 | sky << 20)
+	 * @param vertexX,vertexY,vertexZ vertex position inside its block (0..1)
+	 * @param normalX,normalY,normalZ vertex normal
+	 * @param packedLight packed lightmap coords (block << 4 | sky << 20)
 	 */
-	public void compute(BlockRenderView world, BlockPos pos, float lx, float ly, float lz,
-				 float nx, float ny, float nz, int light, ClConfig cfg) {
-		r = g = b = 1f;
+	public void compute(BlockRenderView world, BlockPos pos, float vertexX, float vertexY, float vertexZ,
+				 float normalX, float normalY, float normalZ, int packedLight, ClConfig config) {
+		redMultiplier = greenMultiplier = blueMultiplier = 1f;
 
-		float bl = (light >> 4) & 15;
-		float sl = (light >> 20) & 15;
-		if (bl <= 0f && sl <= 0f) return; // pitch black: nothing to colour
+		float blockLight = (packedLight >> 4) & 15;
+		float skyLight = (packedLight >> 20) & 15;
+		if (blockLight <= 0f && skyLight <= 0f) return; // pitch black: nothing to colour
+		if (blockLight <= 0f && config.bounceStrength <= 0f) return; // daylight surface, bleed off: nothing to do
 
 		// --- which neighbouring cell does this face look into? -----------------------------
-		float ax = Math.abs(nx), ay = Math.abs(ny), az = Math.abs(nz);
-		int dx = 0, dy = 0, dz = 0;
-		if (ay > 0.7f && ay >= ax && ay >= az) dy = ny > 0 ? 1 : -1;
-		else if (ax > 0.7f && ax >= az) dx = nx > 0 ? 1 : -1;
-		else if (az > 0.7f) dz = nz > 0 ? 1 : -1;
-		// diagonal quads (cross-shaped plants...) keep d = 0 and use their own cell
+		float normalAbsX = Math.abs(normalX), normalAbsY = Math.abs(normalY), normalAbsZ = Math.abs(normalZ);
+		int faceOffsetX = 0, faceOffsetY = 0, faceOffsetZ = 0;
+		if (normalAbsY > 0.7f && normalAbsY >= normalAbsX && normalAbsY >= normalAbsZ) faceOffsetY = normalY > 0 ? 1 : -1;
+		else if (normalAbsX > 0.7f && normalAbsX >= normalAbsZ) faceOffsetX = normalX > 0 ? 1 : -1;
+		else if (normalAbsZ > 0.7f) faceOffsetZ = normalZ > 0 ? 1 : -1;
+		// diagonal quads (cross-shaped plants...) keep the offset at 0 and use their own cell
 
-		// tangent axes A, B of the face plane and which way the vertex leans along each
-		int aX = 0, aY = 0, aZ = 0, bX = 0, bY = 0, bZ = 0;
-		float la, lb;
-		if (dx != 0)      { aY = 1; bZ = 1; la = ly; lb = lz; }
-		else if (dz != 0) { aX = 1; bY = 1; la = lx; lb = ly; }
-		else              { aX = 1; bZ = 1; la = lx; lb = lz; }
-		int sa = la < 0.5f ? -1 : 1;
-		int sb = lb < 0.5f ? -1 : 1;
+		// Unit vectors along the face's two tangent axes (U, V) and how far the vertex leans
+		// along each: vertices below 0.5 lean towards -1 on that axis, above towards +1.
+		int axisUx = 0, axisUy = 0, axisUz = 0, axisVx = 0, axisVy = 0, axisVz = 0;
+		float vertexU, vertexV;
+		if (faceOffsetX != 0)      { axisUy = 1; axisVz = 1; vertexU = vertexY; vertexV = vertexZ; }
+		else if (faceOffsetZ != 0) { axisUx = 1; axisVy = 1; vertexU = vertexX; vertexV = vertexY; }
+		else                       { axisUx = 1; axisVz = 1; vertexU = vertexX; vertexV = vertexZ; }
+		int stepU = vertexU < 0.5f ? -1 : 1;
+		int stepV = vertexV < 0.5f ? -1 : 1;
 
-		int baseX = pos.getX() + dx, baseY = pos.getY() + dy, baseZ = pos.getZ() + dz;
-		int pcx = pos.getX() >> 4, pcz = pos.getZ() >> 4;
+		int baseX = pos.getX() + faceOffsetX, baseY = pos.getY() + faceOffsetY, baseZ = pos.getZ() + faceOffsetZ;
+		int meshChunkX = pos.getX() >> 4, meshChunkZ = pos.getZ() >> 4;
 
-		float lr = 0, lg = 0, lbl = 0, lw = 0; // light hue accumulator (weighted by level)
-		float br = 0, bg = 0, bb = 0;          // bleed accumulator
-		int bn = 0;
+		float hueRed = 0, hueGreen = 0, hueBlue = 0, hueWeightSum = 0; // light hue accumulator (weighted by level)
+		float bleedRed = 0, bleedGreen = 0, bleedBlue = 0;            // bleed accumulator
+		int bleedCellCount = 0;
 
-		for (int i = 0; i < 4; i++) {
-			int ia = (i == 1 || i == 3) ? sa : 0;
-			int ib = (i >= 2) ? sb : 0;
-			int cx = baseX + ia * aX + ib * bX;
-			int cy = baseY + ia * aY + ib * bY;
-			int cz = baseZ + ia * aZ + ib * bZ;
-			if (Math.abs((cx >> 4) - pcx) > 1 || Math.abs((cz >> 4) - pcz) > 1) continue;
+		for (int corner = 0; corner < 4; corner++) {
+			int cornerOffsetU = (corner == 1 || corner == 3) ? stepU : 0;
+			int cornerOffsetV = (corner >= 2) ? stepV : 0;
+			int cellX = baseX + cornerOffsetU * axisUx + cornerOffsetV * axisVx;
+			int cellY = baseY + cornerOffsetU * axisUy + cornerOffsetV * axisVy;
+			int cellZ = baseZ + cornerOffsetU * axisUz + cornerOffsetV * axisVz;
+			if (Math.abs((cellX >> 4) - meshChunkX) > 1 || Math.abs((cellZ >> 4) - meshChunkZ) > 1) continue;
 
-			m.set(cx, cy, cz);
-			BlockState st = world.getBlockState(m);
-			if (st.isOpaqueFullCube(world, m)) {
-				if (i != 0 && cfg.bounceStrength > 0f) { // a wall next to the surface reflects its colour
-					int hue = BlockColourCache.albedoHue(st);
-					br += ColourMath.r(hue); bg += ColourMath.g(hue); bb += ColourMath.b(hue);
-					bn++;
+			cellState(world, cellX, cellY, cellZ);
+			if (lastCellOpaque) {
+				if (corner != 0 && config.bounceStrength > 0f) { // a wall next to the surface reflects its colour
+					bleedRed += ColourMath.r(lastCellHue);
+					bleedGreen += ColourMath.g(lastCellHue);
+					bleedBlue += ColourMath.b(lastCellHue);
+					bleedCellCount++;
 				}
 				continue;
 			}
-			if (bl > 0f) {
-				int s = LightColourField.sample(world, pcx, pcz, cx, cy, cz, m);
-				if (s != 0) {
-					float level = (s >>> 24) & 15;
-					lr += ColourMath.r(s) * level;
-					lg += ColourMath.g(s) * level;
-					lbl += ColourMath.b(s) * level;
-					lw += level;
+			if (blockLight > 0f) {
+				int lightSample = LightColourField.sample(world, meshChunkX, meshChunkZ, cellX, cellY, cellZ, scratchPos);
+				if (lightSample != 0) {
+					float sampleLevel = (lightSample >>> 24) & 15;
+					hueRed += ColourMath.r(lightSample) * sampleLevel;
+					hueGreen += ColourMath.g(lightSample) * sampleLevel;
+					hueBlue += ColourMath.b(lightSample) * sampleLevel;
+					hueWeightSum += sampleLevel;
 				}
 			}
 		}
 
 		// 1) coloured block light
-		float wl = bl / (bl + sl * cfg.skyLightWeight + 1e-3f) * cfg.lightStrength;
-		if (lw > 0f && wl > 0f) {
-			float hr = lr / lw / 255f, hg = lg / lw / 255f, hb = lbl / lw / 255f;
-			r = 1f + (hr - 1f) * wl;
-			g = 1f + (hg - 1f) * wl;
-			b = 1f + (hb - 1f) * wl;
+		float lightInfluence = blockLight / (blockLight + skyLight * config.skyLightWeight + 1e-3f) * config.lightStrength;
+		if (hueWeightSum > 0f && lightInfluence > 0f) {
+			float avgHueRed = hueRed / hueWeightSum / 255f, avgHueGreen = hueGreen / hueWeightSum / 255f,
+					avgHueBlue = hueBlue / hueWeightSum / 255f;
+			redMultiplier = 1f + (avgHueRed - 1f) * lightInfluence;
+			greenMultiplier = 1f + (avgHueGreen - 1f) * lightInfluence;
+			blueMultiplier = 1f + (avgHueBlue - 1f) * lightInfluence;
 		}
 
 		// 2) colour bleed from neighbouring solid blocks
-		if (bn > 0) {
-			float k = cfg.bounceStrength * (bn / 3f) * (Math.max(bl, sl) / 15f);
-			float hr = br / bn / 255f, hg = bg / bn / 255f, hb = bb / bn / 255f;
-			r *= 1f + (hr - 1f) * k;
-			g *= 1f + (hg - 1f) * k;
-			b *= 1f + (hb - 1f) * k;
+		if (bleedCellCount > 0) {
+			float bleedInfluence = config.bounceStrength * (bleedCellCount / 3f) * (Math.max(blockLight, skyLight) / 15f);
+			float avgBleedRed = bleedRed / bleedCellCount / 255f, avgBleedGreen = bleedGreen / bleedCellCount / 255f,
+					avgBleedBlue = bleedBlue / bleedCellCount / 255f;
+			redMultiplier *= 1f + (avgBleedRed - 1f) * bleedInfluence;
+			greenMultiplier *= 1f + (avgBleedGreen - 1f) * bleedInfluence;
+			blueMultiplier *= 1f + (avgBleedBlue - 1f) * bleedInfluence;
 		}
 
-		float min = cfg.minChannel;
-		r = r < min ? min : Math.min(r, 1f);
-		g = g < min ? min : Math.min(g, 1f);
-		b = b < min ? min : Math.min(b, 1f);
+		float minChannel = config.minChannel;
+		redMultiplier = redMultiplier < minChannel ? minChannel : Math.min(redMultiplier, 1f);
+		greenMultiplier = greenMultiplier < minChannel ? minChannel : Math.min(greenMultiplier, 1f);
+		blueMultiplier = blueMultiplier < minChannel ? minChannel : Math.min(blueMultiplier, 1f);
 	}
 }

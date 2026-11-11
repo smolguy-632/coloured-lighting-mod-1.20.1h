@@ -19,10 +19,6 @@ import net.minecraft.text.Text;
 import net.minecraft.util.Identifier;
 
 public class ColouredLightingClient implements ClientModInitializer {
-	/** Light-colour cache entries older than this many client ticks are recomputed (10 s). */
-	private static final int EPOCH_TICKS = 200;
-
-	private int ticks;
 	private ClientWorld lastWorld;
 
 	@Override
@@ -47,10 +43,6 @@ public class ColouredLightingClient implements ClientModInitializer {
 			if (client.world != lastWorld) { // joined a world / changed dimension
 				lastWorld = client.world;
 				LightColourField.clear();
-			}
-			if (++ticks >= EPOCH_TICKS) {
-				ticks = 0;
-				LightColourField.advanceEpoch();
 			}
 		});
 

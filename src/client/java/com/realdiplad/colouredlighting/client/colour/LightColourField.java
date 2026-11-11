@@ -19,9 +19,10 @@ import java.util.concurrent.ConcurrentHashMap;
  *   - the weighted average of the colours of its brighter neighbours (recursively).
  * Where two lights meet the hues blend. Results are memoised per 16^3 section in int[4096] arrays.
  *
- * Entry layout:  bits 0-23 rgb | 24-27 level | 28 valid | 29-31 epoch
- * An entry is only trusted if its level still equals the live level and its epoch is current,
- * so light changes are picked up immediately and emitter-colour changes within ~10 seconds.
+ * Entry layout:  bits 0-23 rgb | 24-27 level | 28 valid
+ * An entry is only trusted if its level still equals the live level, so light changes are picked
+ * up immediately. Emitter-colour changes (resource pack / config reload) clear the whole cache,
+ * which the reload listeners handle explicitly.
  */
 public final class LightColourField {
 	private LightColourField() {}
@@ -32,14 +33,9 @@ public final class LightColourField {
 	private static final int[] DZ = {0, 0, 0, 0, 1, -1};
 
 	private static final ConcurrentHashMap<Long, int[]> SECTIONS = new ConcurrentHashMap<>();
-	private static volatile int epoch = 0;
 
 	public static void clear() {
 		SECTIONS.clear();
-	}
-
-	public static void advanceEpoch() {
-		epoch = (epoch + 1) & 7;
 	}
 
 	public static int sectionCount() {
@@ -47,67 +43,72 @@ public final class LightColourField {
 	}
 
 	/**
-	 * @param pcx,pcz chunk coordinates of the block currently being meshed; cells more than one
-	 *                chunk away are outside the chunk-render snapshot and are ignored
-	 * @param m       scratch position (overwritten)
+	 * @param meshChunkX,meshChunkZ chunk coordinates of the block currently being meshed; cells
+	 *                              more than one chunk away are outside the chunk-render
+	 *                              snapshot and are ignored
+	 * @param scratchPos            scratch position (overwritten)
 	 * @return (blockLightLevel << 24) | 0xRRGGBB hue, or 0 if the cell has no block light
 	 */
-	public static int sample(BlockRenderView world, int pcx, int pcz, int x, int y, int z, BlockPos.Mutable m) {
-		if (Math.abs((x >> 4) - pcx) > 1 || Math.abs((z >> 4) - pcz) > 1) return 0;
+	public static int sample(BlockRenderView world, int meshChunkX, int meshChunkZ, int cellX, int cellY, int cellZ,
+							 BlockPos.Mutable scratchPos) {
+		if (Math.abs((cellX >> 4) - meshChunkX) > 1 || Math.abs((cellZ >> 4) - meshChunkZ) > 1) return 0;
 
-		m.set(x, y, z);
-		int level = world.getLightLevel(LightType.BLOCK, m);
-		if (level <= 0) return 0;
+		scratchPos.set(cellX, cellY, cellZ);
+		int lightLevel = world.getLightLevel(LightType.BLOCK, scratchPos);
+		if (lightLevel <= 0) return 0;
 
-		int[] section = section(x, y, z);
-		int idx = ((y & 15) << 8) | ((z & 15) << 4) | (x & 15);
-		int e = section[idx];
-		if ((e & VALID) != 0 && ((e >>> 29) & 7) == epoch && ((e >>> 24) & 15) == level) {
-			return e & 0x0FFFFFFF;
+		int[] section = section(cellX, cellY, cellZ);
+		int cellIndex = ((cellY & 15) << 8) | ((cellZ & 15) << 4) | (cellX & 15);
+		int cachedEntry = section[cellIndex];
+		if ((cachedEntry & VALID) != 0 && ((cachedEntry >>> 24) & 15) == lightLevel) {
+			return cachedEntry & 0x0FFFFFFF;
 		}
 
-		BlockState state = world.getBlockState(m);
-		int lum = state.getLuminance();
-		int rgb;
-		if (lum > 0 && level <= lum) {
-			rgb = BlockColourCache.emitterColour(state);
+		BlockState state = world.getBlockState(scratchPos);
+		int emitterLuminance = state.getLuminance();
+		int colourRgb;
+		if (emitterLuminance > 0 && lightLevel <= emitterLuminance) {
+			colourRgb = BlockColourCache.emitterColour(state);
 		} else {
-			float r = 0, g = 0, b = 0, wSum = 0;
+			float hueRed = 0, hueGreen = 0, hueBlue = 0, neighbourWeightSum = 0;
 			for (int i = 0; i < 6; i++) {
-				int nx = x + DX[i], ny = y + DY[i], nz = z + DZ[i];
-				if (Math.abs((nx >> 4) - pcx) > 1 || Math.abs((nz >> 4) - pcz) > 1) continue;
-				m.set(nx, ny, nz);
-				int nl = world.getLightLevel(LightType.BLOCK, m);
-				if (nl <= level) continue; // only look "upstream", towards the emitter
-				int s = sample(world, pcx, pcz, nx, ny, nz, m);
-				if (s == 0) continue;
-				float w = (nl - level == 1) ? 1f : 0.35f;
-				r += ColourMath.r(s) * w;
-				g += ColourMath.g(s) * w;
-				b += ColourMath.b(s) * w;
-				wSum += w;
+				int neighbourX = cellX + DX[i], neighbourY = cellY + DY[i], neighbourZ = cellZ + DZ[i];
+				if (Math.abs((neighbourX >> 4) - meshChunkX) > 1 || Math.abs((neighbourZ >> 4) - meshChunkZ) > 1) continue;
+				scratchPos.set(neighbourX, neighbourY, neighbourZ);
+				int neighbourLevel = world.getLightLevel(LightType.BLOCK, scratchPos);
+				if (neighbourLevel <= lightLevel) continue; // only look "upstream", towards the emitter
+				int neighbourSample = sample(world, meshChunkX, meshChunkZ, neighbourX, neighbourY, neighbourZ, scratchPos);
+				if (neighbourSample == 0) continue;
+				float neighbourWeight = (neighbourLevel - lightLevel == 1) ? 1f : 0.35f;
+				hueRed += ColourMath.r(neighbourSample) * neighbourWeight;
+				hueGreen += ColourMath.g(neighbourSample) * neighbourWeight;
+				hueBlue += ColourMath.b(neighbourSample) * neighbourWeight;
+				neighbourWeightSum += neighbourWeight;
 			}
-			rgb = wSum > 0
-				? ColourMath.normaliseMax(ColourMath.pack(Math.round(r / wSum), Math.round(g / wSum), Math.round(b / wSum)))
+			colourRgb = neighbourWeightSum > 0
+				? ColourMath.normaliseMax(ColourMath.pack(
+					Math.round(hueRed / neighbourWeightSum),
+					Math.round(hueGreen / neighbourWeightSum),
+					Math.round(hueBlue / neighbourWeightSum)))
 				: ColourMath.normaliseMax(ClConfig.get().defaultRgb());
 		}
 
-		int out = (level << 24) | rgb;
-		section[idx] = out | VALID | (epoch << 29);
-		return out;
+		int result = (lightLevel << 24) | colourRgb;
+		section[cellIndex] = result | VALID;
+		return result;
 	}
 
-	private static int[] section(int x, int y, int z) {
+	private static int[] section(int cellX, int cellY, int cellZ) {
 		if (SECTIONS.size() > ClConfig.get().cacheMaxSections) {
 			SECTIONS.clear();
 		}
-		long key = ChunkSectionPos.asLong(x >> 4, y >> 4, z >> 4);
-		int[] arr = SECTIONS.get(key);
-		if (arr == null) {
-			arr = new int[4096];
-			int[] prev = SECTIONS.putIfAbsent(key, arr);
-			if (prev != null) arr = prev;
+		long sectionKey = ChunkSectionPos.asLong(cellX >> 4, cellY >> 4, cellZ >> 4);
+		int[] sectionArray = SECTIONS.get(sectionKey);
+		if (sectionArray == null) {
+			sectionArray = new int[4096];
+			int[] existing = SECTIONS.putIfAbsent(sectionKey, sectionArray);
+			if (existing != null) sectionArray = existing;
 		}
-		return arr;
+		return sectionArray;
 	}
 }

@@ -24,30 +24,30 @@ public final class TintingVertexConsumer implements VertexConsumer {
 	private VertexConsumer delegate;
 	private BlockRenderView world;
 	private BlockPos pos;
-	private ClConfig cfg;
+	private ClConfig config;
 	private float tx, ty, tz;
 
 	private TintingVertexConsumer() {}
 
 	public static TintingVertexConsumer wrap(VertexConsumer delegate, BlockRenderView world, BlockPos pos,
-											 MatrixStack.Entry matrix, ClConfig cfg) {
-		TintingVertexConsumer c = LOCAL.get();
-		c.delegate = delegate;
-		c.world = world;
-		c.pos = pos;
-		c.cfg = cfg;
-		Matrix4f m = matrix.getPositionMatrix();
-		c.tx = m.m30(); // block origin inside the buffer (chunk-local while meshing)
-		c.ty = m.m31();
-		c.tz = m.m32();
-		return c;
+											 MatrixStack.Entry matrix, ClConfig config) {
+		TintingVertexConsumer wrapped = LOCAL.get();
+		wrapped.delegate = delegate;
+		wrapped.world = world;
+		wrapped.pos = pos;
+		wrapped.config = config;
+		Matrix4f positionMatrix = matrix.getPositionMatrix();
+		wrapped.tx = positionMatrix.m30(); // block origin inside the buffer (chunk-local while meshing)
+		wrapped.ty = positionMatrix.m31();
+		wrapped.tz = positionMatrix.m32();
+		return wrapped;
 	}
 
 	public void release() {
 		delegate = null;
 		world = null;
 		pos = null;
-		cfg = null;
+		config = null;
 	}
 
 	// ---- the one call we care about ----------------------------------------------------------
@@ -55,10 +55,10 @@ public final class TintingVertexConsumer implements VertexConsumer {
 	public void vertex(float x, float y, float z, float red, float green, float blue, float alpha,
 					   float u, float v, int overlay, int light, float nx, float ny, float nz) {
 		try {
-			tinter.compute(world, pos, x - tx, y - ty, z - tz, nx, ny, nz, light, cfg);
-			red *= tinter.r;
-			green *= tinter.g;
-			blue *= tinter.b;
+			tinter.compute(world, pos, x - tx, y - ty, z - tz, nx, ny, nz, light, config);
+			red *= tinter.redMultiplier;
+			green *= tinter.greenMultiplier;
+			blue *= tinter.blueMultiplier;
 		} catch (Throwable t) { // never let a tint bug take the chunk builder down
 			if (!warned) {
 				warned = true;

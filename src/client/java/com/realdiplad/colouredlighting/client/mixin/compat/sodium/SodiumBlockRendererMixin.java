@@ -32,8 +32,8 @@ public abstract class SodiumBlockRendererMixin {
 	private void coloured_lighting$tintQuad(BlockRenderContext ctx, ChunkModelBuilder builder, Vec3d offset,
 											Material material, BakedQuadView quad, int[] colors,
 											QuadLightData light, CallbackInfo ci) {
-		ClConfig cfg = ClConfig.get();
-		if (!cfg.enabled) return;
+		ClConfig config = ClConfig.get();
+		if (!config.enabled) return;
 
 		float nx = 0f, ny = 0f, nz = 0f;
 		ModelQuadFacing face = quad.getNormalFace();
@@ -48,13 +48,13 @@ public abstract class SodiumBlockRendererMixin {
 		for (int i = 0; i < 4; i++) {
 			// Quad coordinates are block-local (0..1), the space FaceTinter expects.
 			tinter.compute(ctx.world(), ctx.pos(), quad.getX(i), quad.getY(i), quad.getZ(i),
-				nx, ny, nz, light.lm[i], cfg);
+				nx, ny, nz, light.lm[i], config);
 
-			int c = colors[i];
-			int r = Math.round((c & 0xFF) * tinter.r);
-			int g = Math.round(((c >> 8) & 0xFF) * tinter.g);
-			int b = Math.round(((c >> 16) & 0xFF) * tinter.b);
-			colors[i] = (c & 0xFF000000) | (clamp(b) << 16) | (clamp(g) << 8) | clamp(r);
+			int packedColor = colors[i];
+			int r = Math.round((packedColor & 0xFF) * tinter.redMultiplier);
+			int g = Math.round(((packedColor >> 8) & 0xFF) * tinter.greenMultiplier);
+			int b = Math.round(((packedColor >> 16) & 0xFF) * tinter.blueMultiplier);
+			colors[i] = (packedColor & 0xFF000000) | (clamp(b) << 16) | (clamp(g) << 8) | clamp(r);
 		}
 	}
 
