@@ -85,7 +85,7 @@ public class ColouredLightingClient implements ClientModInitializer {
 					})
 					.then(strengthSubCommand("light"))
 					.then(strengthSubCommand("bounce"))
-					.then(strengthSubCommand("sky"))));
+					.then(strengthSubCommand("sky")))));
 	}
 
 	private static com.mojang.brigadier.builder.LiteralArgumentBuilder<FabricClientCommandSource> strengthSubCommand(String name) {
