@@ -22,10 +22,16 @@ Use the same JDK the template's CI uses (JDK 25 builds fine, the output targets 
 |---|---|---|---|
 | texture stats | texture id | average + emissive colour | resource reload |
 | block-state stats | BlockState | average + emissive colour, bleed hue, light colour | resource reload |
-| light-colour field | cell (per 16^3 section int[4096]) | hue + level | live level changes, every 10 s, world change |
+| light-colour field | cell (per 16^3 section int[4096]) | hue + level | live level changes, world change |
 
 ## Commands
-`/colouredlighting reload | toggle | stats`
+`/colouredlighting reload | toggle | stats | strength`
+
+- `strength` - shows the current tint strengths
+- `strength <light|bounce|sky> <0..1>` - changes `lightStrength` / `bounceStrength` / `skyLightWeight`,
+  saves them to the config and rebuilds chunks so the change applies immediately. Example:
+  `/colouredlighting strength bounce 0` disables the colour-bleed pass (the most expensive part)
+  while keeping coloured light on.
 
 ## Config - config/coloured-lighting.json
 `lightStrength`, `bounceStrength` (0 turns the bleed pass off), `skyLightWeight`, `saturationBoost`,

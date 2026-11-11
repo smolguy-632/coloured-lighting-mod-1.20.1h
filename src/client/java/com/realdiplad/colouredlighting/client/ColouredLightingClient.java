@@ -1,5 +1,7 @@
 package com.realdiplad.colouredlighting.client;
 
+import com.mojang.brigadier.arguments.FloatArgumentType;
+import com.mojang.brigadier.context.CommandContext;
 import com.realdiplad.colouredlighting.ColouredLighting;
 import com.realdiplad.colouredlighting.client.colour.BlockColourCache;
 import com.realdiplad.colouredlighting.client.colour.LightColourField;
@@ -7,6 +9,7 @@ import com.realdiplad.colouredlighting.client.config.ClConfig;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
+import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.fabricmc.fabric.api.resource.ResourceManagerHelper;
@@ -70,7 +73,41 @@ public class ColouredLightingClient implements ClientModInitializer {
 							+ BlockColourCache.spriteCount() + " textures, "
 							+ LightColourField.sectionCount() + " light sections"));
 					return 1;
-				}))));
+				}))
+				.then(ClientCommandManager.literal("strength")
+					.executes(ctx -> {
+						ClConfig config = ClConfig.get();
+						ctx.getSource().sendFeedback(Text.literal(String.format(
+							"Coloured Lighting strengths: light %.2f, bounce %.2f, sky weight %.2f "
+								+ "(run /colouredlighting strength <light|bounce|sky> <0..1> to change)",
+							config.lightStrength, config.bounceStrength, config.skyLightWeight)));
+						return 1;
+					})
+					.then(strengthSubCommand("light"))
+					.then(strengthSubCommand("bounce"))
+					.then(strengthSubCommand("sky"))));
+	}
+
+	private static com.mojang.brigadier.builder.LiteralArgumentBuilder<FabricClientCommandSource> strengthSubCommand(String name) {
+		return ClientCommandManager.literal(name)
+			.then(ClientCommandManager.argument("value", FloatArgumentType.floatArg(0f, 1f))
+				.executes(ctx -> setStrength(ctx, name, FloatArgumentType.getFloat(ctx, "value"))));
+	}
+
+	/** Sets one tint strength, persists it to config/coloured-lighting.json and rebuilds chunks
+	 *  so the change is visible immediately (tints are baked into chunk meshes). */
+	private static int setStrength(CommandContext<FabricClientCommandSource> ctx, String name, float value) {
+		ClConfig config = ClConfig.get();
+		switch (name) {
+			case "light" -> config.lightStrength = value;
+			case "bounce" -> config.bounceStrength = value;
+			case "sky" -> config.skyLightWeight = value;
+		}
+		ClConfig.save();
+		rebuildWorld();
+		ctx.getSource().sendFeedback(Text.literal(String.format(
+			"Coloured Lighting: %s strength set to %.2f, rebuilding chunks", name, value)));
+		return 1;
 	}
 
 	private static void clearCaches() {
