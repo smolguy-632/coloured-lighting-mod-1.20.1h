@@ -30,7 +30,7 @@
 		"java": ">=17",
 		"fabric-api": "*"
 	},
-	"conflicts": {
+	"suggests": {
 		"sodium": "*"
 	}
 }

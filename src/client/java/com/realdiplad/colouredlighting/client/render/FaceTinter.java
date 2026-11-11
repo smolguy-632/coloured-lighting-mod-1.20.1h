@@ -22,16 +22,16 @@ import net.minecraft.world.BlockRenderView;
  * The result multiplies the vertex colour, so it is baked into the chunk mesh - zero per-frame cost.
  * One instance per thread; not thread-safe.
  */
-final class FaceTinter {
+public final class FaceTinter {
 	private final BlockPos.Mutable m = new BlockPos.Mutable();
-	float r = 1f, g = 1f, b = 1f;
+	public float r = 1f, g = 1f, b = 1f;
 
 	/**
 	 * @param lx,ly,lz vertex position inside its block (0..1)
 	 * @param nx,ny,nz vertex normal
 	 * @param light    packed lightmap coords (block << 4 | sky << 20)
 	 */
-	void compute(BlockRenderView world, BlockPos pos, float lx, float ly, float lz,
+	public void compute(BlockRenderView world, BlockPos pos, float lx, float ly, float lz,
 				 float nx, float ny, float nz, int light, ClConfig cfg) {
 		r = g = b = 1f;
 

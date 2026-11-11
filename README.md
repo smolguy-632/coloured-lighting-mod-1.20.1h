@@ -4,7 +4,7 @@ Coloured block light + a cheap "fake raytracing" colour-bleed, applied while chu
 Built on top of the Fabric template (Loom / Yarn / Loader versions are the template's).
 
 ## Build
-    ./gradlew build          # -> build/libs/coloured-lighting-1.0.0.jar
+    ./gradlew build          # -> build/libs/coloured-lighting-<version>.jar
     ./gradlew runClient      # test in a dev client
 
 Use the same JDK the template's CI uses (JDK 25 builds fine, the output targets Java 17).
@@ -33,8 +33,15 @@ Use the same JDK the template's CI uses (JDK 25 builds fine, the output targets 
 
     "emitters": { "minecraft:torch": "#FF8800" }
 
+## Sodium
+With Sodium 0.5.13 (mc 1.20.1) installed, the colour pass runs inside Sodium's terrain mesher:
+`SodiumBlockRendererMixin` hooks `BlockRenderer#writeGeometry` and multiplies each vertex's RGB in
+Sodium's colour array. Brightness and AO are unaffected. The mixin only loads when Sodium is present.
+Build setup: the Sodium API is resolved from Modrinth's Maven at compile time (`modCompileOnly`, not bundled in the released jar).
+
 ## Known limits
-* Vanilla chunk renderer only. **Sodium/Embeddium bypass the code this mod hooks** (declared as a conflict).
+* Only tested by static type-check against Sodium 0.5.13's API. Not yet run in game.
+* Embeddium and Iris are untested.
 * Blocks with custom Fabric Rendering API models (not vanilla JSON models) are not tinted.
 * Fluids, entities, block entities and items are not tinted.
 * Vertex colour can only darken, so coloured light is slightly dimmer than white light of equal level.
