@@ -1,0 +1,36 @@
+{
+	"schemaVersion": 1,
+	"id": "coloured-lighting",
+	"version": "${version}",
+	"name": "Coloured Lighting",
+	"description": "Client-side coloured block light plus cheap colour-bleed (fake global illumination) applied while chunks are meshed. Block colours are averaged from textures and cached.",
+	"authors": [
+		"realdiplad"
+	],
+	"license": "CC0-1.0",
+	"icon": "assets/coloured-lighting/icon.png",
+	"environment": "client",
+	"entrypoints": {
+		"main": [
+			"com.realdiplad.colouredlighting.ColouredLighting"
+		],
+		"client": [
+			"com.realdiplad.colouredlighting.client.ColouredLightingClient"
+		]
+	},
+	"mixins": [
+		{
+			"config": "coloured-lighting.client.mixins.json",
+			"environment": "client"
+		}
+	],
+	"depends": {
+		"fabricloader": ">=0.20.1",
+		"minecraft": "~1.20.1",
+		"java": ">=17",
+		"fabric-api": "*"
+	},
+	"conflicts": {
+		"sodium": "*"
+	}
+}
