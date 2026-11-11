@@ -11,111 +11,112 @@ import net.minecraft.world.BlockRenderView;
 /**
  * Computes an RGB multiplier (each channel 0..1) for ONE vertex of a block face.
  *
- * It looks at the 5x5 cells on the air side of the face (radius=2 disc) and mixes two things:
+ * Two ingredients:
  *
- *  1. Light hue  - the colour of the block light reaching the vertex (LightColourField),
- *                  weighted by how much of the vertex's lightmap value is block light vs sky light.
- *  2. Colour bleed from distance-weighted albedo of solid blocks within the disc:
- *                     a cheap distance-falloff "radiosity" that matches the reference look.
+ *  1. Light hue - the colour of the block light reaching the vertex (LightColourField), sampled
+ *     at the four cells that touch the vertex on the air side of the face (like smooth lighting).
+ *  2. Colour bleed - solid blocks on the air side of the face reflect their own average colour
+ *     (BlockColourCache) onto the surface. Sampled over a 5x5 disc around the face with a weight
+ *     that falls off with the distance to the vertex, so tinting is strongest right next to a
+ *     coloured block and fades smoothly - a cheap distance-falloff "radiosity" bounce.
  *
- * The result multiplies the vertex colour, so it is baked into the chunk mesh - zero per-frame cost.
+ * Both are baked into the chunk mesh (zero per-frame cost). The per-face cell data is fetched
+ * once and shared by all four vertices of the quad; the bleed loop only walks the cells that
+ * actually contain coloured blocks, so the common all-air case costs almost nothing per vertex.
  * One instance per thread; not thread-safe.
  */
 public final class FaceTinter {
-
-	/** Maximum bleed sampling radius (in blocks) — cells farther away contribute negligibly. */
-	private static final int BLEED_RADIUS = 2;
-	/** Attenuation per block from the vertex: e.g. at r=1 weight=0.55, r=2 weight=0.30, etc. */
+	/** Bleed sampling radius in blocks around the face centre (5x5 disc at radius 2). */
+	private static final int DISC_RADIUS = 2;
+	private static final int DISC_STRIDE = DISC_RADIUS * 2 + 1; // 5
+	private static final int DISC_CELLS = DISC_STRIDE * DISC_STRIDE; // 25
+	/** Bleed weight per block of Manhattan distance from the vertex. */
 	private static final float BLEED_ATTENUATION = 0.55f;
-
-	/** Normalisation scale for the weighted bleed sum (tuned so a single adjacent wall gives ≈bounce). */
+	/** Weight-sum scale that maps "coloured wall next to the vertex" to ~full bounceStrength. */
 	private static final float BLEED_WEIGHT_SCALE = 2.5f;
-
-	/** Precomputed weight lookup for distances 0..6. */
-	private static final float[] WEIGHTS = {
-			1.0f, BLEED_ATTENUATION, (float) Math.pow(BLEED_ATTENUATION, 2.0f),
-			(float) Math.pow(BLEED_ATTENUATION, 3.0f), (float) Math.pow(BLEED_ATTENUATION, 4.0f),
-			(float) Math.pow(BLEED_ATTENUATION, 5.0f), (float) Math.pow(BLEED_ATTENUATION, 6.0f)
-	};
+	/** Largest per-vertex Manhattan distance: (|du|+1) + (|dv|+1) <= 2*(DISC_RADIUS+1) = 6. */
+	private static final int MAX_BLEED_DISTANCE = 2 * (DISC_RADIUS + 1);
+	/** Precomputed attenuation^distance, indexed by Manhattan distance from the vertex. */
+	private static final float[] BLEED_WEIGHTS = new float[MAX_BLEED_DISTANCE + 1];
+	static {
+		for (int i = 0; i < BLEED_WEIGHTS.length; i++) BLEED_WEIGHTS[i] = (float) Math.pow(BLEED_ATTENUATION, i);
+	}
 
 	private final BlockPos.Mutable scratchPos = new BlockPos.Mutable();
 
-	// Direct-mapped disc cache (5×5 = 25 cells) for a given face, shared across all 4 vertices.
-	// Every call to compute() refills if the face changed, otherwise reuses.
-	private static final int CD_SIZE = 25; // (R+1)²
-	private final boolean[] cdValid = new boolean[CD_SIZE]; // fit within snapshot limits?
-	private final boolean[] cdOpaque = new boolean[CD_SIZE];
-	private final int[] cdHue = new int[CD_SIZE];
+	// Per-face disc cache, refilled whenever the face (position + direction) changes. The four
+	// vertices of a quad share the same face and therefore everything below.
+	private final boolean[] discValid = new boolean[DISC_CELLS]; // inside the world snapshot?
+	private final boolean[] discOpaque = new boolean[DISC_CELLS];
+	// Compacted list of disc cells that actually bleed (opaque blocks), so the per-vertex loop
+	// stays short even though the disc has 25 cells.
+	private final int[] bleedDu = new int[DISC_CELLS];
+	private final int[] bleedDv = new int[DISC_CELLS];
+	private final int[] bleedHue = new int[DISC_CELLS];
+	private int bleedCount;
 
-	// Identity of the last face we filled these disc entries for. (pos is immutable per call.)
-	private int lastPosX, lastPosY, lastPosZ;
-	private int lastFaceOffsetX, lastFaceOffsetY, lastFaceOffsetZ;
+	private long lastFaceKey;  // position of the face centre cell
+	private int lastFaceFlags; // face offset + "wide" flag
 
-	/** Final vertex colour multipliers, read back by the caller after {@link #compute}. */
-	public float redMultiplier = 1f, greenMultiplier = 1f, blueMultiplier = 1f;
+	/** Disc index for offsets (du, dv), each in -DISC_RADIUS..DISC_RADIUS. */
+	private static int discIndex(int du, int dv) {
+		return (du + DISC_RADIUS) * DISC_STRIDE + (dv + DISC_RADIUS);
+	}
 
 	/**
-	 * Ensures the disc cache for the current face is up-to-date.
-	 *
-	 * @param world         world snapshot
-	 * @param pos           mesh position
-	 * @param faceOffsetX/Y/Z direction the face looks into
-	 * @param axisUx/Y/Z    axis U vector components (non-zero only one axis per component)
-	 * @param axisVx/Y/Z    axis V vector components (same rule)
-	 * @param meshChunkX/Z  chunk X/Z for snapshot bounds check
+	 * Fills the disc for one face. With bleed active all 25 cells are sampled; otherwise only
+	 * the 3x3 centre is needed (the four vertices' light samples all land in there).
 	 */
-	private void prepareDisc(BlockRenderView world, int posX, int posY, int posZ,
-	                         int faceOffsetX, int faceOffsetY, int faceOffsetZ,
-	                         int axisUx, int axisUy, int axisUz,
-	                         int axisVx, int axisVy, int axisVz,
-	                         int meshChunkX, int meshChunkZ) {
-		boolean sameFace = (posX == lastPosX && posY == lastPosY && posZ == lastPosZ &&
-				faceOffsetX == lastFaceOffsetX &&
-				faceOffsetY == lastFaceOffsetY &&
-				faceOffsetZ == lastFaceOffsetZ);
-		if (sameFace) return; // reuse cached disc
+	private void ensureDisc(BlockRenderView world, int baseX, int baseY, int baseZ,
+			int faceOffsetX, int faceOffsetY, int faceOffsetZ,
+			int axisUx, int axisUy, int axisUz, int axisVx, int axisVy, int axisVz,
+			int meshChunkX, int meshChunkZ, boolean wide) {
+		int flags = (faceOffsetX + 1) | (faceOffsetY + 1) << 2 | (faceOffsetZ + 1) << 4 | (wide ? 1 << 6 : 0);
+		long key = (baseX & 0x3FFFFFFL) | (baseY & 0xFFFL) << 26 | (baseZ & 0x3FFFFFFL) << 38;
+		if (key == lastFaceKey && flags == lastFaceFlags) return; // same face: reuse everything
+		lastFaceKey = key;
+		lastFaceFlags = flags;
 
-		lastPosX = posX; lastPosY = posY; lastPosZ = posZ;
-		lastFaceOffsetX = faceOffsetX;
-		lastFaceOffsetY = faceOffsetY;
-		lastFaceOffsetZ = faceOffsetZ;
-
-		// Fill the 5×5 disc. Index = (du+2)*5 + (dv+2), where du,dv ∈ [-2,2].
-		for (int du = -BLEED_RADIUS; du <= BLEED_RADIUS; du++) {
-			for (int dv = -BLEED_RADIUS; dv <= BLEED_RADIUS; dv++) {
-				int idx = (du + BLEED_RADIUS + 1) * (BLEED_RADIUS + 1) + (dv + BLEED_RADIUS + 1); // 5*5 = 25
-				int cx = posX + du * axisUx + dv * axisVx;
-				int cy = posY + du * axisUy + dv * axisVy;
-				int cz = posZ + du * axisUz + dv * axisVz;
-				// Out of world snapshot bounds: mark invalid so we skip them later.
-				if (Math.abs((cx >> 4) - meshChunkX) > 1 || Math.abs((cz >> 4) - meshChunkZ) > 1) {
-					cdValid[idx] = false;
+		bleedCount = 0;
+		int radius = wide ? DISC_RADIUS : 1;
+		for (int du = -radius; du <= radius; du++) {
+			for (int dv = -radius; dv <= radius; dv++) {
+				int idx = discIndex(du, dv);
+				int cellX = baseX + du * axisUx + dv * axisVx;
+				int cellY = baseY + du * axisUy + dv * axisVy;
+				int cellZ = baseZ + du * axisUz + dv * axisVz;
+				if (Math.abs((cellX >> 4) - meshChunkX) > 1 || Math.abs((cellZ >> 4) - meshChunkZ) > 1) {
+					discValid[idx] = false; // outside the world snapshot: skip everywhere
 					continue;
 				}
-				cdValid[idx] = true;
-				scratchPos.set(cx, cy, cz);
+				discValid[idx] = true;
+				scratchPos.set(cellX, cellY, cellZ);
 				BlockState state = world.getBlockState(scratchPos);
-				cdOpaque[idx] = state.isOpaqueFullCube(world, scratchPos);
-				cdHue[idx] = cdOpaque[idx] ? BlockColourCache.albedoHue(state) : -1;
+				boolean opaque = state.isOpaqueFullCube(world, scratchPos);
+				discOpaque[idx] = opaque;
+				if (wide && opaque) {
+					bleedDu[bleedCount] = du;
+					bleedDv[bleedCount] = dv;
+					bleedHue[bleedCount] = BlockColourCache.albedoHue(state);
+					bleedCount++;
+				}
 			}
 		}
 	}
 
 	/**
-	 * Computes the tint for one vertex of a block face.
-	 *
 	 * @param vertexX,vertexY,vertexZ vertex position inside its block (0..1)
 	 * @param normalX,normalY,normalZ vertex normal
 	 * @param packedLight packed lightmap coords (block << 4 | sky << 20)
 	 */
 	public void compute(BlockRenderView world, BlockPos pos, float vertexX, float vertexY, float vertexZ,
-	                    float normalX, float normalY, float normalZ, int packedLight, ClConfig config) {
+			float normalX, float normalY, float normalZ, int packedLight, ClConfig config) {
 		redMultiplier = greenMultiplier = blueMultiplier = 1f;
 
 		float blockLight = (packedLight >> 4) & 15;
 		float skyLight = (packedLight >> 20) & 15;
 		if (blockLight <= 0f && skyLight <= 0f) return; // pitch black: nothing to colour
-		if (blockLight <= 0f && config.bounceStrength <= 0f) return; // daylight surface, bleed disabled
+		if (blockLight <= 0f && config.bounceStrength <= 0f) return; // daylight surface, bleed off
 
 		// --- which neighbouring cell does this face look into? -----------------------------
 		float normalAbsX = Math.abs(normalX), normalAbsY = Math.abs(normalY), normalAbsZ = Math.abs(normalZ);
@@ -129,63 +130,30 @@ public final class FaceTinter {
 		// along each: vertices below 0.5 lean towards -1 on that axis, above towards +1.
 		int axisUx = 0, axisUy = 0, axisUz = 0, axisVx = 0, axisVy = 0, axisVz = 0;
 		float vertexU, vertexV;
-		if (faceOffsetX != 0) { axisUy = 1; axisVz = 1; vertexU = vertexY; vertexV = vertexZ; }
+		if (faceOffsetX != 0)      { axisUy = 1; axisVz = 1; vertexU = vertexY; vertexV = vertexZ; }
 		else if (faceOffsetZ != 0) { axisUx = 1; axisVy = 1; vertexU = vertexX; vertexV = vertexY; }
-		else { axisUx = 1; axisVz = 1; vertexU = vertexX; vertexV = vertexZ; }
+		else                       { axisUx = 1; axisVz = 1; vertexU = vertexX; vertexV = vertexZ; }
 		int stepU = vertexU < 0.5f ? -1 : 1;
 		int stepV = vertexV < 0.5f ? -1 : 1;
 
-		int baseX = pos.getX() + faceOffsetX,
-		    baseY = pos.getY() + faceOffsetY,
-		    baseZ = pos.getZ() + faceOffsetZ;
-		int meshChunkX = pos.getX() >> 4,
-		    meshChunkZ = pos.getZ() >> 4;
+		int baseX = pos.getX() + faceOffsetX, baseY = pos.getY() + faceOffsetY, baseZ = pos.getZ() + faceOffsetZ;
+		int meshChunkX = pos.getX() >> 4, meshChunkZ = pos.getZ() >> 4;
 
-		// Fill disc once per face; all vertices reuse it.
-		prepareDisc(world, baseX, baseY, baseZ,
-		            faceOffsetX, faceOffsetY, faceOffsetZ,
-		            axisUx, axisUy, axisUz,
-		            axisVx, axisVy, axisVz,
-		            meshChunkX, meshChunkZ);
+		boolean wide = config.bounceStrength > 0f;
+		ensureDisc(world, baseX, baseY, baseZ, faceOffsetX, faceOffsetY, faceOffsetZ,
+				axisUx, axisUy, axisUz, axisVx, axisVy, axisVz, meshChunkX, meshChunkZ, wide);
 
-		// Light hue accumulator (weighted by level).
+		// 1) coloured block light: sample the light field at the four cells touching the vertex
 		float hueRed = 0, hueGreen = 0, hueBlue = 0, hueWeightSum = 0;
-
-		// Colour bleed accumulator (distance-weighted).
-		float bleedRed = 0, bleedGreen = 0, bleedBlue = 0, bleedWeightSum = 0;
-
-		// Sample the 4 corner cells and the disc for bleed.
-		for (int corner = 0; corner < 4; corner++) {
-			int cornerOffsetU = (corner == 1 || corner == 3) ? stepU : 0;
-			int cornerOffsetV = (corner >= 2) ? stepV : 0;
-			int cellX = baseX + cornerOffsetU * axisUx + cornerOffsetV * axisVx;
-			int cellY = baseY + cornerOffsetU * axisUy + cornerOffsetV * axisVy;
-			int cellZ = baseZ + cornerOffsetU * axisUz + cornerOffsetV * axisVz;
-			// Fast out-of-snapshot check using the disc index which already knows valid/invalid.
-			int idx = (cornerOffsetU + BLEED_RADIUS + 1) * (BLEED_RADIUS + 1) + (cornerOffsetV + BLEED_RADIUS + 1);
-			if (!cdValid[idx]) {
-				// Cell outside world snapshot; no light to sample.
-				if (blockLight > 0f) {
-					// Light beyond snapshot: not reachable (or should be filtered out earlier).
-				}
-				continue;
-			}
-
-			// Skip solid blocks for light sampling.
-			if (cdOpaque[idx]) {
-				// Opaque cell contributes to colour bleed (distance-weighted albedo).
-				int hue = cdHue[idx];
-				int dist = Math.abs(cornerOffsetU - stepU) + Math.abs(cornerOffsetV - stepV);
-				float w = WEIGHTS[dist];
-				bleedRed += ColourMath.r(hue) * w;
-				bleedGreen += ColourMath.g(hue) * w;
-				bleedBlue += ColourMath.b(hue) * w;
-				bleedWeightSum += w;
-				continue;
-			}
-
-			// Non-opaque cell: sample light field.
-			if (blockLight > 0f) {
+		if (blockLight > 0f && config.lightStrength > 0f) {
+			for (int corner = 0; corner < 4; corner++) {
+				int cornerOffsetU = (corner == 1 || corner == 3) ? stepU : 0;
+				int cornerOffsetV = (corner >= 2) ? stepV : 0;
+				int idx = discIndex(cornerOffsetU, cornerOffsetV);
+				if (!discValid[idx] || discOpaque[idx]) continue; // outside snapshot / inside a solid
+				int cellX = baseX + cornerOffsetU * axisUx + cornerOffsetV * axisVx;
+				int cellY = baseY + cornerOffsetU * axisUy + cornerOffsetV * axisVy;
+				int cellZ = baseZ + cornerOffsetU * axisUz + cornerOffsetV * axisVz;
 				int lightSample = LightColourField.sample(world, meshChunkX, meshChunkZ, cellX, cellY, cellZ, scratchPos);
 				if (lightSample != 0) {
 					float sampleLevel = (lightSample >>> 24) & 15;
@@ -197,31 +165,40 @@ public final class FaceTinter {
 			}
 		}
 
-		// 1) Coloured block light.
 		float lightInfluence = blockLight / (blockLight + skyLight * config.skyLightWeight + 1e-3f) * config.lightStrength;
 		if (hueWeightSum > 0f && lightInfluence > 0f) {
-			float avgHueRed = hueRed / hueWeightSum / 255f,
-			      avgHueGreen = hueGreen / hueWeightSum / 255f,
-			      avgHueBlue = hueBlue / hueWeightSum / 255f;
+			float avgHueRed = hueRed / hueWeightSum / 255f, avgHueGreen = hueGreen / hueWeightSum / 255f,
+					avgHueBlue = hueBlue / hueWeightSum / 255f;
 			redMultiplier = 1f + (avgHueRed - 1f) * lightInfluence;
 			greenMultiplier = 1f + (avgHueGreen - 1f) * lightInfluence;
 			blueMultiplier = 1f + (avgHueBlue - 1f) * lightInfluence;
 		}
 
-		// 2) Distance-weighted colour bleed.
-		if (bleedWeightSum > 0f) {
-			float bleedInfluence = config.bounceStrength *
-					   Math.min(1.0f, bleedWeightSum / BLEED_WEIGHT_SCALE) *
-					   (Math.max(blockLight, skyLight) / 15.0f);
-			float avgBleedRed = bleedRed / bleedWeightSum / 255f,
-			      avgBleedGreen = bleedGreen / bleedWeightSum / 255f,
-			      avgBleedBlue = bleedBlue / bleedWeightSum / 255f;
-			redMultiplier *= 1f + (avgBleedRed - 1f) * bleedInfluence;
-			greenMultiplier *= 1f + (avgBleedGreen - 1f) * bleedInfluence;
-			blueMultiplier *= 1f + (avgBleedBlue - 1f) * bleedInfluence;
+		// 2) colour bleed: distance-weighted reflection from the coloured blocks in the disc.
+		// Walks only the compacted list of opaque cells, so all-air faces cost nothing here.
+		if (bleedCount > 0) {
+			float bleedRed = 0, bleedGreen = 0, bleedBlue = 0, bleedWeightSum = 0;
+			for (int i = 0; i < bleedCount; i++) {
+				int distance = Math.abs(bleedDu[i] - stepU) + Math.abs(bleedDv[i] - stepV);
+				float weight = BLEED_WEIGHTS[distance];
+				int hue = bleedHue[i];
+				bleedRed += ColourMath.r(hue) * weight;
+				bleedGreen += ColourMath.g(hue) * weight;
+				bleedBlue += ColourMath.b(hue) * weight;
+				bleedWeightSum += weight;
+			}
+			if (bleedWeightSum > 0f) {
+				float bleedInfluence = config.bounceStrength
+						* Math.min(1f, bleedWeightSum / BLEED_WEIGHT_SCALE)
+						* (Math.max(blockLight, skyLight) / 15f);
+				float avgBleedRed = bleedRed / bleedWeightSum / 255f, avgBleedGreen = bleedGreen / bleedWeightSum / 255f,
+						avgBleedBlue = bleedBlue / bleedWeightSum / 255f;
+				redMultiplier *= 1f + (avgBleedRed - 1f) * bleedInfluence;
+				greenMultiplier *= 1f + (avgBleedGreen - 1f) * bleedInfluence;
+				blueMultiplier *= 1f + (avgBleedBlue - 1f) * bleedInfluence;
+			}
 		}
 
-		// Clamp low channels (options adjustable)
 		float minChannel = config.minChannel;
 		redMultiplier = redMultiplier < minChannel ? minChannel : Math.min(redMultiplier, 1f);
 		greenMultiplier = greenMultiplier < minChannel ? minChannel : Math.min(greenMultiplier, 1f);
