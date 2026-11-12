@@ -44,6 +44,9 @@ public final class FaceTinter {
 
 	private final BlockPos.Mutable scratchPos = new BlockPos.Mutable();
 
+	/** Final vertex colour multipliers, read back by the caller after {@link #compute}. */
+	public float redMultiplier = 1f, greenMultiplier = 1f, blueMultiplier = 1f;
+
 	// Per-face disc cache, refilled whenever the face (position + direction) changes. The four
 	// vertices of a quad share the same face and therefore everything below.
 	private final boolean[] discValid = new boolean[DISC_CELLS]; // inside the world snapshot?
